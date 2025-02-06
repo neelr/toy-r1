@@ -7,13 +7,14 @@ from typing import List, Tuple
 
 
 class ReasoningHashDataset(Dataset):
-    def __init__(self,  tokenizer, num_samples: int = 1000, hash_length: int = 5,
+    def __init__(self,  tokenizer, rl=True, num_samples: int = 1000, hash_length: int = 5,
                  chains: List[int] = [2, 3, 4, 5, 6], vary_hash: bool = True, num_chains: int = 5, device="cpu"):
         self.device = device
+        self.rl = rl
         self.tokenizer = tokenizer
         self.data = []
         self.hash_length = hash_length
-        self.max_length = sum(chains) * (hash_length + 3) + 100  # 100 is a buffer
+        self.max_length = 0
         for _ in range(num_samples):
             if vary_hash:
                 # Step 1: Sample 1 chain between the smallest and second biggest
@@ -44,9 +45,15 @@ class ReasoningHashDataset(Dataset):
             random.shuffle(hash_list)
             for key, value in hash_list:
                 prompt += f"{key}=>{value}\n"
+            random_hash_list = hash_list.copy()
+            random.shuffle(random_hash_list)
+            new_prompt = f"Lets reconstruct the list:\n"
+            for key, value in random_hash_list:
+                new_prompt += f"{key}=>{value}\n"
             prompt += f"""Start: {
-                start}\nTask: Find the shortest end {hash_length} character hash in the chains. Think hard in tag! Circle your answer in <circle>HERE</circle> after </think>\n\n"""
-            full_text = f"{prompt} {shortest_target}"
+                start}\nTask: Multiple hash chains are provided. Find the shortest chain and provide the end {hash_length} char hash. Think hard in tag! Circle your answer in <circle>HERE</circle> after </think>\n-----\nSTART\n"""
+            full_text = f"{prompt}<think>{new_prompt}</think>\n<circle>{shortest_target}</circle>"
+            self.max_length = max(self.max_length, len(self.tokenizer(f"{prompt}<think>")["input_ids"]))
             self.data.append(
                 (full_text, hash_list, start, shortest_target, prompt))
 
@@ -55,40 +62,54 @@ class ReasoningHashDataset(Dataset):
 
     def __getitem__(self, idx):
         full_text, _, _, target, prompt = self.data[idx]
-        prompt += "<think>"
+        if self.rl:
+            prompt += "<think>"
 
-        # Tokenize with left padding and truncation
-        encoded_input = self.tokenizer(
-            prompt,
-            padding='max_length',
-            truncation=True,
-            max_length=self.max_length,
-            padding_side='left',  # Ensure left padding
-            return_tensors="pt"
-        ).to(self.device)
+            # Tokenize with left padding and truncation
+            encoded_input = self.tokenizer(
+                prompt,
+                padding='max_length',
+                truncation=True,
+                max_length=self.max_length,
+                padding_side='left',  # Ensure left padding
+                return_tensors="pt"
+            ).to(self.device)
 
-        # Tokenize target with padding
-        encoded_target = self.tokenizer(
-            target,
-            padding='max_length',
-            truncation=True,
-            max_length=self.hash_length + 2,  # Add small buffer for hash length
-            padding_side='left',  # Ensure left padding
-            return_tensors="pt"
-        ).to(self.device)
+            # Tokenize target with padding
+            encoded_target = self.tokenizer(
+                target,
+                padding='max_length',
+                max_length=self.hash_length + 2,  # Add small buffer for hash length
+                padding_side='right',  # Ensure left padding
+                return_tensors="pt"
+            ).to(self.device)
 
-        encoded_input["input_ids"] = encoded_input["input_ids"].squeeze(0)
-        encoded_input["attention_mask"] = encoded_input["attention_mask"].squeeze(0)
-        encoded_target["input_ids"] = encoded_target["input_ids"].squeeze(0)
+            encoded_input["input_ids"] = encoded_input["input_ids"].squeeze(0)
+            encoded_input["attention_mask"] = encoded_input["attention_mask"].squeeze(0)
+            encoded_target["input_ids"] = encoded_target["input_ids"].squeeze(0)
 
-        return {
-            "input": encoded_input,
-            "text": prompt,
-            "target": encoded_target["input_ids"]
-        }
+            return {
+                "input": encoded_input,
+                "text": prompt,
+                "target": encoded_target["input_ids"]
+            }
+        else:
+            encoded_input = self.tokenizer(full_text, return_tensors="pt", padding_side="right",padding="max_length", truncation=True, max_length=self.max_length).to(self.device)
+            encoded_input["input_ids"] = encoded_input["input_ids"].squeeze(0)
+            encoded_input["attention_mask"] = encoded_input["attention_mask"].squeeze(0)
+            return {
+                "input": encoded_input,
+            }
 
     def get_eval_item(self, idx):
-        return self.data[idx]
+        d = self.data[idx]
+        return (
+            d[0],
+            d[1],
+            d[2],
+            d[3],
+            d[4] + "<think>"
+        )
 
     @ staticmethod
     def generate_hash_list(hash_length: int, chains: List[int]) -> Tuple[List[Tuple[str, str]], str, str]:

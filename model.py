@@ -1,28 +1,33 @@
 from transformers import AutoTokenizer
 import logging
 from datetime import datetime
-from transformers import AutoModelForCausalLM, AutoTokenizer
+from transformers import AutoModelForCausalLM, AutoTokenizer, StoppingCriteria, StoppingCriteriaList
 import torch
 import torch.nn.functional as F
 import torch as T
 from dataset import ReasoningHashDataset
 from torch.utils.data import DataLoader
+import os
 
-model_name = "Qwen/Qwen2.5-0.5B"
-tokenizer = AutoTokenizer.from_pretrained(model_name, trust_remote_code=True)
+model_path = "model_checkpoint_sft2"
+tokenizer = AutoTokenizer.from_pretrained(model_path)
 model = AutoModelForCausalLM.from_pretrained(
-    model_name,
+    model_path,
     device_map="auto",
-    trust_remote_code=True,
     torch_dtype=T.bfloat16
 )
 
+# save directory 
+main_dir = f"model_{datetime.now().strftime('%Y%m%d_%H%M%S')}"
+os.makedirs(main_dir, exist_ok=True)
+
+hash_length = 4
 # Create a small test dataset
 dataset = ReasoningHashDataset(
     tokenizer=tokenizer,
     num_samples=10000,  # Small number for testing
-    hash_length=4,  # Shorter hashes for testing
-    chains=[2, 3, 4],  # Simpler chain lengths
+    hash_length=hash_length,# Shorter hashes for testing
+    chains=[2, 3, 4, 5, 6],  # Simpler chain lengths
     vary_hash=True,
     num_chains=3,
     device=model.device
@@ -30,159 +35,162 @@ dataset = ReasoningHashDataset(
 
 # Create reference model (copy of initial weights)
 ref_model = AutoModelForCausalLM.from_pretrained(
-    model_name, torch_dtype=torch.bfloat16, device_map="auto", trust_remote_code=True)
+    model_path, torch_dtype=torch.bfloat16, device_map="auto", trust_remote_code=True)
 optimizer = torch.optim.AdamW(model.parameters(), lr=1e-5)
 
+stop_tokens = [
+            tokenizer.encode("</circle", add_special_tokens=False),
+            tokenizer.encode(" </circle", add_special_tokens=False)
+]
+
+# Custom stopping criteria class
+class StopOnTokens(StoppingCriteria):
+    def __init__(self, stop_token_ids):
+        self.stop_token_ids = stop_token_ids
+
+    def __call__(self, input_ids, scores, **kwargs):
+        for stop_ids in self.stop_token_ids:
+            # Safety checks
+            if len(input_ids[0]) < len(stop_ids):
+                continue
+                
+            # Get the last n tokens where n is length of stop_ids
+            last_tokens = input_ids[0][-len(stop_ids):].tolist()
+            
+            if last_tokens == stop_ids:
+                return True
+        return False
+
+stopping_criteria = StoppingCriteriaList([StopOnTokens(stop_tokens)])
 
 def compute_rewards_batched(output_ids: torch.Tensor, target_ids: torch.Tensor,
                             tokenizer: AutoTokenizer) -> torch.Tensor:
     """
-    Compute rewards for circle tag content matching in a batched manner.
-
+    Compute rewards for circle tag content matching by converting to string space.
+    
     Args:
-        output_ids: Tensor of shape [batch_size, seq_len] containing token ids
-        target_ids: Tensor of shape [target_len] containing target token ids
-        tokenizer: Tokenizer for encoding tags
-
+        output_ids: Tensor of shape [batch_size, seq_len] containing token ids  
+        target_ids: Tensor of shape [batch_size, target_len] containing target token ids
+        tokenizer: Tokenizer for decoding ids to text
+    
     Returns:
         Tensor of shape [batch_size] containing reward values
     """
-    batch_size, seq_len = output_ids.shape
     device = output_ids.device
-
-    # Encode tags once
-    start_tag = torch.tensor(tokenizer.encode("circle>", add_special_tokens=False),
-                             device=device)
-    end_tag = torch.tensor(tokenizer.encode("</circle", add_special_tokens=False),
-                           device=device)
-
-    start_len = start_tag.size(0)
-    end_len = end_tag.size(0)
-    target_len = target_ids.size(0)
-
-    # Initialize rewards
+    batch_size = output_ids.shape[0]
     rewards = torch.zeros(batch_size, device=device)
-
-    # Create sliding windows for tag detection
-    # [batch_size, seq_len - window_size + 1, window_size]
-    start_windows = F.unfold(output_ids.unsqueeze(1).float(),
-                             (1, start_len)).view(batch_size, -1, start_len)
-    end_windows = F.unfold(output_ids.unsqueeze(1).float(),
-                           (1, end_len)).view(batch_size, -1, end_len)
-
-    # Find tag positions
-    # [batch_size, seq_len - start_len + 1]
-    start_matches = torch.all(start_windows == start_tag, dim=-1)
-    end_matches = torch.all(end_windows == end_tag, dim=-1)
-
-    # Get first occurrence of tags
-    start_pos = torch.argmax(start_matches.float(), dim=-1)
-    end_pos = torch.argmax(end_matches.float(), dim=-1)
-
-    # Validate tag positions and extract content
-    valid_tags = (start_pos < end_pos) & (start_pos > 0) & (end_pos < seq_len)
-
-    if valid_tags.any():
-        # Handle valid tag cases
-        valid_batch = torch.where(valid_tags)[0]
-
-        for idx in valid_batch:
-            s_pos = start_pos[idx] + start_len
-            e_pos = end_pos[idx]
-
-            # Extract content between tags
-            content = output_ids[idx, s_pos:e_pos]
-
-            # Check content match
-            if content.size(0) == target_len and torch.equal(content, target_ids):
-                rewards[idx] = 5.0  # Full reward
-            else:
-                rewards[idx] = 1.0  # Partial reward
-
-    # Handle start tag only cases
-    start_only = start_matches.any(dim=-1) & ~valid_tags
-    rewards[start_only] = 0.5
-
+    
+    for i in range(batch_size):
+        output = tokenizer.decode(output_ids[i], skip_special_tokens=True)
+        target = tokenizer.decode(target_ids[i//output_ids.size(0)], skip_special_tokens=True)
+        
+        # Find content between circle tags
+        start_tag = "circle>"
+        end_tag = "</circle"
+        end_think = "</think>"
+        output = output[output.find(end_think):]
+        
+        start_pos = output.find(start_tag)
+        if start_pos != -1:
+            start_pos += len(start_tag)
+            end_pos = output.find(end_tag, start_pos)
+            
+            if end_pos != -1:
+                content = output[start_pos:end_pos].strip()
+                if content == target:
+                    rewards[i] = 20.0  # Full reward
+                elif len(content) > 0:
+                    if content in target:
+                        rewards[i] += 2.0
+                    if len(content) == len(target):
+                        rewards[i] += 3.0
+                        # check number of characters in common
+                        common = 0
+                        for c in content:
+                            if c in target:
+                                common += 1
+                        rewards[i] += common
+                    else:
+                        rewards[i] = 1 # Partial reward
+    
     return rewards
 
 
 def compute_format_rewards_batched(output_ids: torch.Tensor,
                                    tokenizer: AutoTokenizer) -> torch.Tensor:
     """
-    Compute rewards for think tag completion in a batched manner.
+    Compute rewards for think tag completion in a batched manner, operating in string space.
 
     Args:
         output_ids: Tensor of shape [batch_size, seq_len] containing token ids
-        tokenizer: Tokenizer for encoding tags
+        tokenizer: Tokenizer for decoding tokens to text
 
     Returns:
         Tensor of shape [batch_size] containing reward values
     """
-    batch_size, seq_len = output_ids.shape
+    batch_size = output_ids.shape[0]
     device = output_ids.device
 
     # Define closing tags
     closing_tags = ['</think>', ' </think>', '\n</think>']
-    tag_tensors = [torch.tensor(tokenizer.encode(tag, add_special_tokens=False),
-                                device=device) for tag in closing_tags]
+    
+    # Initialize results tensor
+    rewards = torch.zeros(batch_size, dtype=torch.float, device=device)
+    
+    # Decode each sequence in the batch
+    decoded_sequences = []
+    for i in range(batch_size):
+        # Skip special tokens to get clean text
+        decoded = tokenizer.decode(output_ids[i], skip_special_tokens=True)
+        decoded_sequences.append(decoded)
+    
+    # Process each sequence
+    for idx, sequence in enumerate(decoded_sequences):
+        # Find earliest closing tag
+        positions = []
+        for tag in closing_tags:
+            pos = sequence.find(tag)
+            if pos != -1:  # Found tag
+                positions.append(pos)
+        
+        # Get earliest position if any tags found
+        min_pos = min(positions) if positions else float('inf')
+        
+        # Calculate rewards based on position
+        if min_pos == float('inf'):
+            # No closing tag found
+            rewards[idx] = 0.0
+        elif min_pos == 0:
+            # Tag at start
+            rewards[idx] = 0.5
+        else:
+            # Valid position - base reward plus content reward
+            # Scale content reward based on character length instead of tokens
+            base_reward = 1.0
+            # Cap content reward at 1.0, scale based on characters
+            content_reward = max(min(0.01 * min_pos - 0.01 * (len(sequence) - min_pos), 3.0),0 )
+            rewards[idx] = base_reward + content_reward
+            
+        # Add penalty for multiple closing tags
+        if sum(1 for tag in closing_tags if tag in sequence) > 1:
+            rewards[idx] *= 0.8  # 20% penalty for multiple closing tags
 
-    # Initialize results
-    min_positions = torch.full((batch_size,), float('inf'), device=device)
-
-    # Find earliest closing tag for each sequence in batch
-    for tag_tensor in tag_tensors:
-        tag_len = tag_tensor.size(0)
-
-        # Create sliding windows
-        # [batch_size, seq_len - tag_len + 1, tag_len]
-        windows = F.unfold(output_ids.unsqueeze(1).float(),
-                           (1, tag_len)).view(batch_size, -1, tag_len)
-
-        # Find matches
-        # [batch_size, seq_len - tag_len + 1]
-        matches = torch.all(windows == tag_tensor, dim=-1)
-
-        # Get positions of first match in each sequence
-        positions = torch.where(
-            matches.any(dim=-1),
-            torch.argmax(matches.float(), dim=-1),
-            torch.full((batch_size,), seq_len, device=device)
-        )
-
-        # Update minimum positions
-        min_positions = torch.minimum(min_positions, positions)
-
-    # Calculate rewards
-    no_tag = min_positions == float('inf')
-    zero_pos = min_positions == 0
-    valid_pos = ~no_tag & ~zero_pos
-
-    # Initialize rewards
-    rewards = torch.zeros_like(min_positions, dtype=torch.float)
-
-    # No closing tag
-    rewards[no_tag] = 0.0
-
-    # Closing tag at start
-    rewards[zero_pos] = 0.5
-
-    # Valid positions
-    if valid_pos.any():
-        base_reward = 1.0
-        content_reward = torch.minimum(0.1 * min_positions[valid_pos],
-                                       torch.tensor(1.0, device=device))
-        rewards[valid_pos] = base_reward + content_reward
+        # check if there is a </circle> tag before the </think> tag
+        if sequence.find("</circle>") < min_pos:
+            rewards[idx] -= 0.5
+            rewards[idx] = max(rewards[idx], 0.0)
 
     return rewards
 
 
 # Flat training loop
-num_epochs = 5
-group_size = 5  # Number of samples per input
-max_completion_length = 200  # Maximum completion length
-beta = 0.2  # KL penalty coefficient
-log_every = 50  # Log every N batches
-ref_model_every = 5  # Update reference model every N epochs
+num_epochs = 1
+group_size = 8  # Number of samples per input
+max_completion_length = 400  # Maximum completion length
+beta = 0.1  # KL penalty coefficient
+log_every = 25  # Log every N batches
+ref_model_every = 50  # Update reference model every N epochs
+batch_size = 3  # Batch size
 device = model.device
 start_time = datetime.now()
 
@@ -197,7 +205,7 @@ logging.basicConfig(
     ]
 )
 
-dataloader = DataLoader(dataset, batch_size=8, shuffle=True)
+dataloader = DataLoader(dataset, batch_size=batch_size, shuffle=True)
 
 
 # Initialize tracking metrics
@@ -227,13 +235,16 @@ for epoch in range(num_epochs):
         # Generate multiple outputs for each input in batch
         # This will give us (B*G, S) outputs where G is num_generations
         outputs = model.generate(
-            **batch["input"],
+            input_ids=input_ids,
+            attention_mask=attention_mask,
             max_new_tokens=max_completion_length,
             do_sample=True,
             num_return_sequences=group_size,
-            temperature=0.7,
+            temperature=0.6,
+            top_p=0.95,
             pad_token_id=tokenizer.pad_token_id,
-            eos_token_id=tokenizer.eos_token_id
+            eos_token_id=tokenizer.eos_token_id,
+            #stopping_criteria=stopping_criteria
         )
 
         # Get completion lengths and mask
@@ -334,7 +345,13 @@ for epoch in range(num_epochs):
         epoch_stats['policy_losses'].append(mean_grouped_rewards.mean().item())
 
         if batch_idx % log_every == 0:
-            # Log batch-level metrics
+            # Get a sample input and output to log
+            sample_idx = 0  # Take first example from batch
+            input_text = tokenizer.decode(input_ids[sample_idx], skip_special_tokens=True)
+            output_text = tokenizer.decode(outputs[sample_idx], skip_special_tokens=True)
+            target_text = tokenizer.decode(target[sample_idx], skip_special_tokens=True)
+            
+            # Log batch-level metrics and sample text
             logging.info(
                 f"\nBatch Progress:\n"
                 f"Epoch: [{epoch+1}/{num_epochs}] "
@@ -345,10 +362,20 @@ for epoch in range(num_epochs):
                 f"├── Per-batch Reward Std: {rewards_grouped.std(dim=1).mean().item():.4f}\n"
                 f"├── KL Divergence: {per_token_kl.mean().item():.4f}\n"
                 f"├── Mean Advantage: {mean_grouped_rewards.mean().item():.4f}\n"
-                f"└── Avg Completion Length: {completion_mask.sum(1).float().mean().item():.1f}"
+                f"├── Avg Completion Length: {completion_mask.sum(1).float().mean().item():.1f}\n"
+                f"Sample Input-Output:\n"
+                f"└── Output: {output_text}"
+                f"└── Target: {target_text}"
             )
-            # Save model at the end of each epoch
-            save_dir = f'model_checkpoint_batch_{batch+1}'
+
+        # Update reference model
+        if batch_idx % ref_model_every == 0:
+            ref_model.load_state_dict(model.state_dict())
+            ref_model.eval()
+            logging.info("Updated reference model weights")
+
+            # Save model at logging interval
+            save_dir = f"{main_dir}/model_checkpoint_batch_{batch_idx}"
             model.save_pretrained(save_dir)
             tokenizer.save_pretrained(save_dir)
             logging.info(f"Saved model checkpoint to {save_dir}")
