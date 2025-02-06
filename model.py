@@ -6,10 +6,11 @@ import torch
 import torch.nn.functional as F
 import torch as T
 from dataset import ReasoningHashDataset
+from rewards import compute_rewards_batched, compute_format_rewards_batched
 from torch.utils.data import DataLoader
 import os
 
-model_path = "model_checkpoint_sft2"
+model_path = "model_20250206_083544/model_checkpoint_batch_300"
 tokenizer = AutoTokenizer.from_pretrained(model_path)
 model = AutoModelForCausalLM.from_pretrained(
     model_path,
@@ -25,7 +26,7 @@ hash_length = 4
 # Create a small test dataset
 dataset = ReasoningHashDataset(
     tokenizer=tokenizer,
-    num_samples=10000,  # Small number for testing
+    num_samples=20000,  # Small number for testing
     hash_length=hash_length,# Shorter hashes for testing
     chains=[2, 3, 4, 5, 6],  # Simpler chain lengths
     vary_hash=True,
@@ -36,7 +37,8 @@ dataset = ReasoningHashDataset(
 # Create reference model (copy of initial weights)
 ref_model = AutoModelForCausalLM.from_pretrained(
     model_path, torch_dtype=torch.bfloat16, device_map="auto", trust_remote_code=True)
-optimizer = torch.optim.AdamW(model.parameters(), lr=1e-5)
+optimizer = torch.optim.AdamW(model.parameters(), lr=2e-5)
+torch.set_float32_matmul_precision('high')
 
 stop_tokens = [
             tokenizer.encode("</circle", add_special_tokens=False),
@@ -63,134 +65,15 @@ class StopOnTokens(StoppingCriteria):
 
 stopping_criteria = StoppingCriteriaList([StopOnTokens(stop_tokens)])
 
-def compute_rewards_batched(output_ids: torch.Tensor, target_ids: torch.Tensor,
-                            tokenizer: AutoTokenizer) -> torch.Tensor:
-    """
-    Compute rewards for circle tag content matching by converting to string space.
-    
-    Args:
-        output_ids: Tensor of shape [batch_size, seq_len] containing token ids  
-        target_ids: Tensor of shape [batch_size, target_len] containing target token ids
-        tokenizer: Tokenizer for decoding ids to text
-    
-    Returns:
-        Tensor of shape [batch_size] containing reward values
-    """
-    device = output_ids.device
-    batch_size = output_ids.shape[0]
-    rewards = torch.zeros(batch_size, device=device)
-    
-    for i in range(batch_size):
-        output = tokenizer.decode(output_ids[i], skip_special_tokens=True)
-        target = tokenizer.decode(target_ids[i//output_ids.size(0)], skip_special_tokens=True)
-        
-        # Find content between circle tags
-        start_tag = "circle>"
-        end_tag = "</circle"
-        end_think = "</think>"
-        output = output[output.find(end_think):]
-        
-        start_pos = output.find(start_tag)
-        if start_pos != -1:
-            start_pos += len(start_tag)
-            end_pos = output.find(end_tag, start_pos)
-            
-            if end_pos != -1:
-                content = output[start_pos:end_pos].strip()
-                if content == target:
-                    rewards[i] = 20.0  # Full reward
-                elif len(content) > 0:
-                    if content in target:
-                        rewards[i] += 2.0
-                    if len(content) == len(target):
-                        rewards[i] += 3.0
-                        # check number of characters in common
-                        common = 0
-                        for c in content:
-                            if c in target:
-                                common += 1
-                        rewards[i] += common
-                    else:
-                        rewards[i] = 1 # Partial reward
-    
-    return rewards
-
-
-def compute_format_rewards_batched(output_ids: torch.Tensor,
-                                   tokenizer: AutoTokenizer) -> torch.Tensor:
-    """
-    Compute rewards for think tag completion in a batched manner, operating in string space.
-
-    Args:
-        output_ids: Tensor of shape [batch_size, seq_len] containing token ids
-        tokenizer: Tokenizer for decoding tokens to text
-
-    Returns:
-        Tensor of shape [batch_size] containing reward values
-    """
-    batch_size = output_ids.shape[0]
-    device = output_ids.device
-
-    # Define closing tags
-    closing_tags = ['</think>', ' </think>', '\n</think>']
-    
-    # Initialize results tensor
-    rewards = torch.zeros(batch_size, dtype=torch.float, device=device)
-    
-    # Decode each sequence in the batch
-    decoded_sequences = []
-    for i in range(batch_size):
-        # Skip special tokens to get clean text
-        decoded = tokenizer.decode(output_ids[i], skip_special_tokens=True)
-        decoded_sequences.append(decoded)
-    
-    # Process each sequence
-    for idx, sequence in enumerate(decoded_sequences):
-        # Find earliest closing tag
-        positions = []
-        for tag in closing_tags:
-            pos = sequence.find(tag)
-            if pos != -1:  # Found tag
-                positions.append(pos)
-        
-        # Get earliest position if any tags found
-        min_pos = min(positions) if positions else float('inf')
-        
-        # Calculate rewards based on position
-        if min_pos == float('inf'):
-            # No closing tag found
-            rewards[idx] = 0.0
-        elif min_pos == 0:
-            # Tag at start
-            rewards[idx] = 0.5
-        else:
-            # Valid position - base reward plus content reward
-            # Scale content reward based on character length instead of tokens
-            base_reward = 1.0
-            # Cap content reward at 1.0, scale based on characters
-            content_reward = max(min(0.01 * min_pos - 0.01 * (len(sequence) - min_pos), 3.0),0 )
-            rewards[idx] = base_reward + content_reward
-            
-        # Add penalty for multiple closing tags
-        if sum(1 for tag in closing_tags if tag in sequence) > 1:
-            rewards[idx] *= 0.8  # 20% penalty for multiple closing tags
-
-        # check if there is a </circle> tag before the </think> tag
-        if sequence.find("</circle>") < min_pos:
-            rewards[idx] -= 0.5
-            rewards[idx] = max(rewards[idx], 0.0)
-
-    return rewards
-
-
 # Flat training loop
 num_epochs = 1
-group_size = 8  # Number of samples per input
+group_size = 5  # Number of samples per input
 max_completion_length = 400  # Maximum completion length
-beta = 0.1  # KL penalty coefficient
+beta = 0.095  # KL penalty coefficient
 log_every = 25  # Log every N batches
 ref_model_every = 50  # Update reference model every N epochs
-batch_size = 3  # Batch size
+batch_size = 2  # Batch size
+gradient_accumulation_steps = 3  # Gradient accumulation steps
 device = model.device
 start_time = datetime.now()
 
@@ -207,21 +90,13 @@ logging.basicConfig(
 
 dataloader = DataLoader(dataset, batch_size=batch_size, shuffle=True)
 
-
-# Initialize tracking metrics
-running_stats = {
-    'losses': [],
-    'rewards': [],
-    'kl_divs': [],
-    'policy_losses': []
-}
-
 for epoch in range(num_epochs):
     epoch_stats = {
         'losses': [],
         'rewards': [],
         'kl_divs': [],
-        'policy_losses': []
+        'policy_losses': [],
+        'completion_lengths': []
     }
 
     for batch_idx in range(len(dataloader)):
@@ -297,10 +172,10 @@ for epoch in range(num_epochs):
         # Shape: (B*G, S+C-1)
 
         # Compute rewards
-        completions = tokenizer.batch_decode(
-            completion_ids, skip_special_tokens=True)
         rewards = compute_rewards_batched(
-            completion_ids, target, tokenizer) + compute_format_rewards_batched(completion_ids, tokenizer)
+            completion_ids.view(
+            batch_size, group_size, -1), target, tokenizer) + compute_format_rewards_batched(completion_ids.view(
+            batch_size, group_size, -1), tokenizer)
 
         # Compute group-wise statistics for advantages
         # Reshape rewards to (B, G) to compute stats per batch item
@@ -314,7 +189,7 @@ for epoch in range(num_epochs):
         std_grouped_rewards = std_grouped_rewards.repeat_interleave(
             group_size)  # Shape: (B*G)
 
-        # Compute advantages
+        rewards = rewards.reshape(-1)  # Shape: (B*G)
         advantages = (rewards - mean_grouped_rewards) / \
             (std_grouped_rewards + 1e-4)  # Shape: (B*G)
 
@@ -333,16 +208,18 @@ for epoch in range(num_epochs):
         masked_loss = (per_token_loss * full_completion_mask)
         loss = (masked_loss.sum(dim=1) /
                 full_completion_mask.sum(dim=1)).mean()
-
-        # Backward and optimize
-        loss.backward()
-        optimizer.step()
+        torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
+        if batch_idx % gradient_accumulation_steps == 0:
+            loss.backward()
+            optimizer.step()
+            optimizer.zero_grad()
 
         # Update statistics per batch
         epoch_stats['losses'].append(loss.item())
         epoch_stats['rewards'].append(rewards.mean().item())
         epoch_stats['kl_divs'].append(per_token_kl.mean().item())
         epoch_stats['policy_losses'].append(mean_grouped_rewards.mean().item())
+        epoch_stats['completion_lengths'].append(completion_mask.sum(1).float().mean().item())
 
         if batch_idx % log_every == 0:
             # Get a sample input and output to log
@@ -378,4 +255,6 @@ for epoch in range(num_epochs):
             save_dir = f"{main_dir}/model_checkpoint_batch_{batch_idx}"
             model.save_pretrained(save_dir)
             tokenizer.save_pretrained(save_dir)
+            # save metric arrays
+            torch.save(epoch_stats, f"{main_dir}/epoch_stats.pt")
             logging.info(f"Saved model checkpoint to {save_dir}")

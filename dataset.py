@@ -56,6 +56,8 @@ class ReasoningHashDataset(Dataset):
             self.max_length = max(self.max_length, len(self.tokenizer(f"{prompt}<think>")["input_ids"]))
             self.data.append(
                 (full_text, hash_list, start, shortest_target, prompt))
+        if not rl:
+            self.max_length = 256
 
     def __len__(self):
         return len(self.data)
